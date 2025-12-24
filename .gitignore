@@ -1,13 +1,15 @@
-# Python
 __pycache__/
+*.pyc
 *.py[cod]
 *.pyo
 *.pyd
 
 # Environments
 .env
+*.env
 .venv/
 venv/
+bot/.venv/
 
 # Editors/OS
 .vscode/
@@ -18,5 +20,7 @@ Thumbs.db
 # Logs
 *.log
 
-# Redis
+# Local services / dumps
 dump.rdb
+my-strapi-app/
+strapi-backend/
