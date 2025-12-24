@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import io
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, parse_qsl, urlunparse, quote
 
 import redis.asyncio as redis
 import aiohttp
@@ -23,6 +25,53 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 
+@dataclass
+class StrapiConfig:
+    url_base: str
+    products_url: str
+    products_params: Dict[str, str]
+    token_read: Optional[str]
+    token_write: Optional[str]
+
+    @property
+    def auth_token(self) -> Optional[str]:
+        return self.token_write or self.token_read
+
+
+_strapi_config: Optional[StrapiConfig] = None
+
+
+def set_strapi_config(config: StrapiConfig) -> None:
+    global _strapi_config
+    _strapi_config = config
+
+
+def get_strapi_config() -> StrapiConfig:
+    if _strapi_config is None:
+        raise RuntimeError("Strapi config is not initialized")
+    return _strapi_config
+
+
+def build_strapi_config_from_env() -> StrapiConfig:
+    url_base = os.getenv("STRAPI_URL_BASE", "http://localhost:1337")
+    products_env = os.getenv("STRAPI_URL")
+    if products_env:
+        parsed = urlparse(products_env)
+        products_url = urlunparse(parsed._replace(query="", fragment=""))
+        products_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    else:
+        products_url = f"{url_base}/api/products"
+        products_params = {"populate": "*"}
+
+    return StrapiConfig(
+        url_base=url_base,
+        products_url=products_url,
+        products_params=products_params,
+        token_read=os.getenv("STRAPI_TOKEN"),
+        token_write=os.getenv("STRAPI_TOKEN_WRITE"),
+    )
+
+
 class ShopStates(StatesGroup):
     handle_menu = State()
     handle_cart = State()
@@ -30,9 +79,10 @@ class ShopStates(StatesGroup):
 
 
 async def fetch_product_by_id(product_id: str) -> Optional[Dict[str, Any]]:
-    url_base = os.getenv("STRAPI_URL_BASE", "http://localhost:1337")
-    url = f"{url_base}/api/products/{product_id}?populate=*"
-    token = os.getenv("STRAPI_TOKEN")
+    config = get_strapi_config()
+    url = f"{config.url_base}/api/products/{quote(str(product_id))}"
+    token = config.token_read
+    params = {"populate": "*"}
 
     headers = {}
     if token:
@@ -40,7 +90,7 @@ async def fetch_product_by_id(product_id: str) -> Optional[Dict[str, Any]]:
 
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers) as resp:
+        async with session.get(url, headers=headers, params=params) as resp:
             if resp.status == 404:
                 return None
             resp.raise_for_status()
@@ -49,10 +99,10 @@ async def fetch_product_by_id(product_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def create_cart(telegram_id: str) -> Dict[str, Any]:
-    """Создать корзину с указанным telegram_id (пустые items)."""
-    url_base = os.getenv("STRAPI_URL_BASE", "http://localhost:1337")
-    url = f"{url_base}/api/carts"
-    token = os.getenv("STRAPI_TOKEN_WRITE") or os.getenv("STRAPI_TOKEN")
+    
+    config = get_strapi_config()
+    url = f"{config.url_base}/api/carts"
+    token = config.auth_token
 
     headers = {"Content-Type": "application/json"}
     if token:
@@ -64,17 +114,20 @@ async def create_cart(telegram_id: str) -> Dict[str, Any]:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, headers=headers, json=payload) as resp:
             if resp.status == 409:
-                # Возможно уникальный telegram_id уже существует
                 return {"error": "Cart already exists"}
             resp.raise_for_status()
             return await resp.json()
 
 
 async def fetch_cart_by_telegram(telegram_id: str) -> Optional[Dict[str, Any]]:
-    """Получить корзину по telegram_id (первую найденную)."""
-    url_base = os.getenv("STRAPI_URL_BASE", "http://localhost:1337")
-    url = f"{url_base}/api/carts?filters[telegram_id][$eq]={telegram_id}&populate[items][populate][product]=true"
-    token = os.getenv("STRAPI_TOKEN_WRITE") or os.getenv("STRAPI_TOKEN")
+   
+    config = get_strapi_config()
+    url = f"{config.url_base}/api/carts"
+    token = config.auth_token
+    params = {
+        "filters[telegram_id][$eq]": telegram_id,
+        "populate[items][populate][product]": "true",
+    }
 
     headers = {}
     if token:
@@ -82,18 +135,19 @@ async def fetch_cart_by_telegram(telegram_id: str) -> Optional[Dict[str, Any]]:
 
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers) as resp:
+        async with session.get(url, headers=headers, params=params) as resp:
             resp.raise_for_status()
             payload = await resp.json()
-            data = payload.get("data") or []
-            return data[0] if data else None
+            carts = payload.get("data") or []
+            return carts[0] if carts else None
 
 
 async def fetch_client_by_telegram(telegram_id: str) -> Optional[Dict[str, Any]]:
-    """Получить клиента по telegram_id (первого найденного)."""
-    url_base = os.getenv("STRAPI_URL_BASE", "http://localhost:1337")
-    url = f"{url_base}/api/clients?filters[telegram_id][$eq]={telegram_id}"
-    token = os.getenv("STRAPI_TOKEN_WRITE") or os.getenv("STRAPI_TOKEN")
+    
+    config = get_strapi_config()
+    url = f"{config.url_base}/api/clients"
+    token = config.auth_token
+    params = {"filters[telegram_id][$eq]": telegram_id}
 
     headers = {}
     if token:
@@ -101,17 +155,17 @@ async def fetch_client_by_telegram(telegram_id: str) -> Optional[Dict[str, Any]]
 
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers) as resp:
+        async with session.get(url, headers=headers, params=params) as resp:
             resp.raise_for_status()
             payload = await resp.json()
-            data = payload.get("data") or []
-            return data[0] if data else None
+            clients = payload.get("data") or []
+            return clients[0] if clients else None
 
 
 async def upsert_client_email(telegram_id: str, email: str) -> None:
-    """Создать или обновить клиента с email по telegram_id."""
-    url_base = os.getenv("STRAPI_URL_BASE", "http://localhost:1337")
-    token = os.getenv("STRAPI_TOKEN_WRITE") or os.getenv("STRAPI_TOKEN")
+   
+    config = get_strapi_config()
+    token = config.auth_token
 
     headers = {"Content-Type": "application/json"}
     if token:
@@ -123,7 +177,7 @@ async def upsert_client_email(telegram_id: str, email: str) -> None:
     if not existing:
         payload = {"data": {"telegram_id": telegram_id, "email": email}}
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{url_base}/api/clients", headers=headers, json=payload) as resp:
+            async with session.post(f"{config.url_base}/api/clients", headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 await resp.json()
         return
@@ -131,15 +185,15 @@ async def upsert_client_email(telegram_id: str, email: str) -> None:
     client_doc_id = existing.get("documentId") or existing.get("id")
     payload = {"data": {"email": email}}
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.put(f"{url_base}/api/clients/{client_doc_id}", headers=headers, json=payload) as resp:
+        async with session.put(f"{config.url_base}/api/clients/{client_doc_id}", headers=headers, json=payload) as resp:
             resp.raise_for_status()
             await resp.json()
 
 
 async def upsert_cart_with_item(telegram_id: str, product_id: int, quantity: float = 1.0) -> None:
-    """Создать корзину, если нет, или добавить позицию в существующую."""
-    url_base = os.getenv("STRAPI_URL_BASE", "http://localhost:1337")
-    token = os.getenv("STRAPI_TOKEN_WRITE") or os.getenv("STRAPI_TOKEN")
+    
+    config = get_strapi_config()
+    token = config.auth_token
 
     headers = {"Content-Type": "application/json"}
     if token:
@@ -151,7 +205,7 @@ async def upsert_cart_with_item(telegram_id: str, product_id: int, quantity: flo
         payload = {"data": {"telegram_id": telegram_id, "items": [{"product": product_id, "quantity": quantity}]}}
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{url_base}/api/carts", headers=headers, json=payload) as resp:
+            async with session.post(f"{config.url_base}/api/carts", headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 await resp.json()
         return
@@ -175,15 +229,15 @@ async def upsert_cart_with_item(telegram_id: str, product_id: int, quantity: flo
     payload = {"data": {"items": new_items}}
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.put(f"{url_base}/api/carts/{cart_doc_id}", headers=headers, json=payload) as resp:
+        async with session.put(f"{config.url_base}/api/carts/{cart_doc_id}", headers=headers, json=payload) as resp:
             resp.raise_for_status()
             await resp.json()
 
 
 async def update_cart_items(cart_doc_id: str, items: List[Dict[str, Any]]) -> None:
-    """Заменить список items в корзине."""
-    url_base = os.getenv("STRAPI_URL_BASE", "http://localhost:1337")
-    token = os.getenv("STRAPI_TOKEN_WRITE") or os.getenv("STRAPI_TOKEN")
+    
+    config = get_strapi_config()
+    token = config.auth_token
 
     headers = {"Content-Type": "application/json"}
     if token:
@@ -192,20 +246,20 @@ async def update_cart_items(cart_doc_id: str, items: List[Dict[str, Any]]) -> No
     payload = {"data": {"items": items}}
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.put(f"{url_base}/api/carts/{cart_doc_id}", headers=headers, json=payload) as resp:
+        async with session.put(f"{config.url_base}/api/carts/{cart_doc_id}", headers=headers, json=payload) as resp:
             resp.raise_for_status()
             await resp.json()
 
 
 async def download_image(url: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[BufferedInputFile]:
-    """Скачать картинку и вернуть как BufferedInputFile для Telegram."""
+  
     close_session = False
     if session is None:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
         close_session = True
     try:
         async with session.get(url) as resp:
-            if resp.status != 200:
+            if not resp.ok:
                 return None
             data = await resp.read()
             filename = url.split("/")[-1] or "image.jpg"
@@ -216,7 +270,7 @@ async def download_image(url: str, session: Optional[aiohttp.ClientSession] = No
 
 
 def _chunk_buttons(buttons: List[InlineKeyboardButton], width: int = 2) -> List[List[InlineKeyboardButton]]:
-    # Разбиваем список кнопок на строки по width.
+    
     rows: List[List[InlineKeyboardButton]] = []
     for i in range(0, len(buttons), width):
         rows.append(buttons[i : i + width])
@@ -224,9 +278,11 @@ def _chunk_buttons(buttons: List[InlineKeyboardButton], width: int = 2) -> List[
 
 
 async def fetch_products() -> List[Dict[str, Any]]:
-    """Получение опубликованных товаров из Strapi."""
-    url = os.getenv("STRAPI_URL", "http://localhost:1337/api/products?populate=*")
-    token = os.getenv("STRAPI_TOKEN")
+    
+    config = get_strapi_config()
+    url = config.products_url
+    params = config.products_params
+    token = config.token_read
 
     headers = {}
     if token:
@@ -234,7 +290,7 @@ async def fetch_products() -> List[Dict[str, Any]]:
 
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers) as resp:
+        async with session.get(url, headers=headers, params=params) as resp:
             resp.raise_for_status()
             payload = await resp.json()
             return payload.get("data", [])
@@ -251,7 +307,7 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 
 async def echo(message: Message, state: FSMContext) -> None:
-    # В состоянии меню игнорируем произвольный текст и подсказываем вызвать /start
+   
     await state.set_state(ShopStates.handle_menu)
     await message.answer("Используйте кнопки или команду /start, чтобы выбрать товар.")
 
@@ -295,7 +351,7 @@ async def send_products_menu(target: Message) -> None:
                 callback_data=f"product:{numeric_id}:{doc_id}",
             )
         )
-    # Добавляем кнопку "Моя корзина" отдельной строкой
+
     rows = _chunk_buttons(buttons, width=2)
     rows.append([InlineKeyboardButton(text="🧺 Моя корзина", callback_data="mycart")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -307,7 +363,7 @@ async def send_products_menu(target: Message) -> None:
 
 
 async def render_cart(message: Message, telegram_id: str) -> None:
-    """Показать корзину с кнопками удаления и кнопкой 'В меню'."""
+    
     cart = await fetch_cart_by_telegram(telegram_id)
     if not cart or not cart.get("items"):
         keyboard = InlineKeyboardMarkup(
@@ -338,32 +394,32 @@ async def render_cart(message: Message, telegram_id: str) -> None:
     await message.answer("\n".join(lines), reply_markup=keyboard)
 
 
-async def button_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    data = callback.data or ""
-    if data == "mycart":
+async def handle_button(callback: CallbackQuery, state: FSMContext) -> None:
+    callback_data = callback.data or ""
+    if callback_data == "mycart":
         await state.set_state(ShopStates.handle_cart)
     else:
         await state.set_state(ShopStates.handle_menu)
     await callback.answer()
 
-    if data == "back_to_list":
+    if callback_data == "back_to_list":
         await state.set_state(ShopStates.handle_menu)
         await send_products_menu(callback.message)
         return
 
-    if data == "mycart":
+    if callback_data == "mycart":
         telegram_id = str(callback.from_user.id)
         await render_cart(callback.message, telegram_id)
         return
-    if data == "checkout":
+    if callback_data == "checkout":
         await state.set_state(ShopStates.waiting_email)
         await callback.message.answer("Введите вашу почту для оформления:")
         return
 
-    if data.startswith("cart_remove:"):
+    if callback_data.startswith("cart_remove:"):
         telegram_id = str(callback.from_user.id)
         try:
-            idx_str = data.split(":", 1)[1]
+            idx_str = callback_data.split(":", 1)[1]
             idx = int(idx_str)
         except Exception:
             await callback.message.answer("Некорректный номер позиции.")
@@ -378,7 +434,7 @@ async def button_handler(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.answer("Позиция не найдена.")
             return
 
-        # Удаляем выбранный элемент
+       
         new_items: List[Dict[str, Any]] = []
         for i, item in enumerate(items):
             if i == idx:
@@ -392,8 +448,8 @@ async def button_handler(callback: CallbackQuery, state: FSMContext) -> None:
         await render_cart(callback.message, telegram_id)
         return
 
-    if data.startswith("product:"):
-        parts = data.split(":")
+    if callback_data.startswith("product:"):
+        parts = callback_data.split(":")
         product_numeric_id = parts[1] if len(parts) > 1 else None
         product_doc_id = parts[2] if len(parts) > 2 else parts[1]
 
@@ -417,14 +473,14 @@ async def button_handler(callback: CallbackQuery, state: FSMContext) -> None:
             ]
         )
 
-        # Ищем картинку в поле picture (media)
+        
         image_url = None
         picture = product.get("picture")
         if isinstance(picture, list) and picture:
             first = picture[0] or {}
             image_url = first.get("url")
             if image_url and image_url.startswith("/"):
-                image_url = f"{os.getenv('STRAPI_URL_BASE', 'http://localhost:1337')}{image_url}"
+                image_url = f"{get_strapi_config().url_base}{image_url}"
 
         caption = f"<b>{title}</b>\nЦена: {price_text}\n\n{description}"
 
@@ -448,9 +504,9 @@ async def button_handler(callback: CallbackQuery, state: FSMContext) -> None:
             )
         return
 
-    if data.startswith("addcart:"):
+    if callback_data.startswith("addcart:"):
         telegram_id = str(callback.from_user.id)
-        product_numeric_id = data.split(":", 1)[1]
+        product_numeric_id = callback_data.split(":", 1)[1]
         try:
             await upsert_cart_with_item(telegram_id, int(product_numeric_id), quantity=1.0)
             await callback.message.answer("Товар добавлен в корзину.")
@@ -459,7 +515,7 @@ async def button_handler(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.answer("Не удалось добавить в корзину. Попробуйте позже.")
         return
 
-    await callback.message.answer(f"Вы выбрали: {data}")
+    await callback.message.answer(f"Вы выбрали: {callback_data}")
 
 
 async def main() -> None:
@@ -469,6 +525,7 @@ async def main() -> None:
     redis_host = os.getenv("REDIS_HOST", "127.0.0.1")
     redis_port = int(os.getenv("REDIS_PORT", "6379"))
     redis_db = int(os.getenv("REDIS_DB", "0"))
+    set_strapi_config(build_strapi_config_from_env())
 
     if not token:
         raise RuntimeError("BOT_TOKEN is not set in the environment")
@@ -486,7 +543,7 @@ async def main() -> None:
     dp.message.register(echo, ShopStates.handle_menu, F.text)
     dp.message.register(echo_email, ShopStates.waiting_email, F.text)
     dp.callback_query.register(
-        button_handler,
+        handle_button,
         F.data.regexp(r"^(product:|back_to_list|addcart:|mycart$|cart_remove:|checkout)"),
     )
 
